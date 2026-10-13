@@ -32,6 +32,7 @@ import org.apache.lucene.index.MergeState;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.VectorUtil;
 
 /**
@@ -39,20 +40,20 @@ import org.apache.lucene.util.VectorUtil;
  * the centroid needs no pass of its own over the raw vectors.
  *
  * <p>{@link #wrap} returns a {@link MergeState} whose vector readers add every vector they return
- * to a per-segment sum. {@link #finish} checks that each live vector was added exactly once, and
- * falls back to a separate pass over the live vectors when it was not.
+ * to a per-segment sum, once per ordinal. {@link #finish} uses these sums only when the ordinals
+ * added are exactly the live ones, and otherwise sums the live vectors in a separate pass.
  */
 final class MergedCentroidCollector {
   private final FieldInfo fieldInfo;
   private final boolean cosine;
   private final float[][] segmentSums;
-  private final int[] segmentCounts;
+  private final FixedBitSet[] segmentAdded;
 
   MergedCentroidCollector(FieldInfo fieldInfo, int numSegments) {
     this.fieldInfo = fieldInfo;
     this.cosine = fieldInfo.getVectorSimilarityFunction() == COSINE;
     this.segmentSums = new float[numSegments][];
-    this.segmentCounts = new int[numSegments];
+    this.segmentAdded = new FixedBitSet[numSegments];
   }
 
   /** Returns a copy of {@code in} whose vector readers record the vectors read for this field. */
@@ -98,10 +99,26 @@ final class MergedCentroidCollector {
       if (values == null) {
         continue;
       }
-      int live = liveCount(values, mergeState.liveDocs[i]);
-      liveVectorCount += live;
-      if (segmentCounts[i] != live) {
-        collectedAll = false;
+      Bits liveDocs = mergeState.liveDocs[i];
+      FixedBitSet added = segmentAdded[i];
+      if (liveDocs == null) {
+        int live = values.size();
+        liveVectorCount += live;
+        if ((added == null ? 0 : added.cardinality()) != live) {
+          collectedAll = false;
+        }
+        continue;
+      }
+      // Reads doc ids only, not vectors.
+      KnnVectorValues.DocIndexIterator iterator = values.iterator();
+      for (int doc = iterator.nextDoc(); doc != NO_MORE_DOCS; doc = iterator.nextDoc()) {
+        boolean live = liveDocs.get(doc);
+        if (live) {
+          liveVectorCount++;
+        }
+        if (live != (added != null && added.get(iterator.index()))) {
+          collectedAll = false;
+        }
       }
     }
     double[] sum = new double[centroid.length];
@@ -123,21 +140,6 @@ final class MergedCentroidCollector {
       VectorUtil.l2normalize(centroid);
     }
     return liveVectorCount;
-  }
-
-  /** Counts the docs with a vector that are still live. Reads doc ids only, not vectors. */
-  private static int liveCount(KnnVectorValues values, Bits liveDocs) throws IOException {
-    if (liveDocs == null) {
-      return values.size();
-    }
-    int live = 0;
-    KnnVectorValues.DocIndexIterator iterator = values.iterator();
-    for (int doc = iterator.nextDoc(); doc != NO_MORE_DOCS; doc = iterator.nextDoc()) {
-      if (liveDocs.get(doc)) {
-        live++;
-      }
-    }
-    return live;
   }
 
   /** Fallback: sums the live vectors with a separate pass over the merged view. */
@@ -175,26 +177,25 @@ final class MergedCentroidCollector {
   }
 
   /**
-   * Adds a vector the merge read to its segment's sum. Only ordinals above the last one added
-   * count, so a vector read twice is added once; vectors read out of order are missed and caught by
-   * the count check in {@link #finish}.
+   * Adds a vector the merge read to its segment's sum, unless that ordinal was already added. Which
+   * ordinals were added is checked in {@link #finish}.
    */
   private final class SegmentSum {
-    private final int segment;
-    private int lastOrd = -1;
+    private final float[] sum;
+    private final FixedBitSet added;
 
-    SegmentSum(int segment, int dimension) {
-      this.segment = segment;
+    SegmentSum(int segment, int dimension, int size) {
       if (segmentSums[segment] == null) {
         segmentSums[segment] = new float[dimension];
+        segmentAdded[segment] = new FixedBitSet(size);
       }
+      this.sum = segmentSums[segment];
+      this.added = segmentAdded[segment];
     }
 
     void add(int ord, float[] vector) {
-      if (ord > lastOrd) {
-        lastOrd = ord;
-        MergedCentroidCollector.this.add(segmentSums[segment], vector);
-        segmentCounts[segment]++;
+      if (added.getAndSet(ord) == false) {
+        MergedCentroidCollector.this.add(sum, vector);
       }
     }
   }
@@ -220,7 +221,8 @@ final class MergedCentroidCollector {
       if (values == null || field.equals(fieldInfo.name) == false) {
         return values;
       }
-      return new CollectingFloatVectorValues(values, new SegmentSum(segment, values.dimension()));
+      return new CollectingFloatVectorValues(
+          values, new SegmentSum(segment, values.dimension(), values.size()));
     }
 
     @Override
@@ -229,7 +231,8 @@ final class MergedCentroidCollector {
       if (values == null || field.equals(fieldInfo.name) == false) {
         return values;
       }
-      return new CollectingFloat16VectorValues(values, new SegmentSum(segment, values.dimension()));
+      return new CollectingFloat16VectorValues(
+          values, new SegmentSum(segment, values.dimension(), values.size()));
     }
 
     @Override

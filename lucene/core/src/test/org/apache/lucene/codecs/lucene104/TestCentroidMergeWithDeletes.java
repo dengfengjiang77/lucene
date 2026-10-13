@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.function.IntPredicate;
 import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.document.Document;
@@ -53,6 +54,7 @@ import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.InfoStream;
 import org.apache.lucene.util.VectorUtil;
+import org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncoding;
 
 /** The merged centroid must be computed from the live vectors only. */
 public class TestCentroidMergeWithDeletes extends LuceneTestCase {
@@ -106,9 +108,30 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
     check(VectorSimilarityFunction.EUCLIDEAN, i -> i < PER_SEGMENT && i % 4 == 0, false, true);
   }
 
+  /**
+   * HNSW merges go through mergeOneFlatVectorFieldForMergeScorer, and an asymmetric encoding takes
+   * its branch that also writes query-side vectors. A graph threshold of 0 always builds a graph,
+   * so that branch runs.
+   */
+  public void testHnsw() throws Exception {
+    for (ScalarEncoding encoding :
+        new ScalarEncoding[] {
+          ScalarEncoding.UNSIGNED_BYTE, ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE
+        }) {
+      KnnVectorsFormat hnsw =
+          new Lucene104HnswScalarQuantizedVectorsFormat(encoding, 16, 100, 1, null, 0);
+      check(
+          hnsw,
+          VectorSimilarityFunction.EUCLIDEAN,
+          i -> i < PER_SEGMENT && i % 4 == 0,
+          false,
+          false);
+    }
+  }
+
   /** Ways a raw vector merge might read the wrapped vectors. */
   private enum ReadPattern {
-    /** Each live vector once, in ordinal order: the collected sums are used. */
+    /** Each live vector once, in ordinal order. */
     IN_ORDER,
     /** Nothing read. */
     NONE,
@@ -119,12 +142,14 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
     /** Live vectors read through {@code copy()}, which is not wrapped. */
     VIA_COPY,
     /** Deleted vectors read as well. */
-    WITH_DELETED
+    WITH_DELETED,
+    /** In ordinal order, one deleted vector read instead of a live one, so the count matches. */
+    SWAPPED
   }
 
   /**
-   * Drives the collector with each read pattern. Every pattern except IN_ORDER leaves the
-   * per-segment counts wrong, so only the fallback can produce the expected centroid.
+   * Drives the collector with each read pattern. IN_ORDER, REVERSE and TWICE add exactly the live
+   * vectors, so the collected sums are used; the other patterns must fall back.
    */
   public void testFallbackOnUnexpectedReads() throws Exception {
     for (VectorSimilarityFunction sim :
@@ -232,6 +257,25 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
       }
       case VIA_COPY -> readLive(reader.getFloatVectorValues(FIELD).copy(), liveDocs, false, false);
       case WITH_DELETED -> readLive(reader.getFloatVectorValues(FIELD), liveDocs, false, true);
+      case SWAPPED -> readSwapped(reader.getFloatVectorValues(FIELD), liveDocs);
+    }
+  }
+
+  private static void readSwapped(FloatVectorValues values, Bits liveDocs) throws IOException {
+    List<Integer> live = new ArrayList<>();
+    int deletedOrd = -1;
+    KnnVectorValues.DocIndexIterator it = values.iterator();
+    for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+      if (liveDocs.get(doc)) {
+        live.add(it.index());
+      } else if (deletedOrd == -1) {
+        deletedOrd = it.index();
+      }
+    }
+    live.set(0, deletedOrd);
+    Collections.sort(live);
+    for (int ord : live) {
+      values.vectorValue(ord);
     }
   }
 
@@ -368,6 +412,21 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
       boolean fp16,
       boolean firstSegmentWithoutCentroid)
       throws Exception {
+    check(
+        new Lucene104ScalarQuantizedVectorsFormat(),
+        sim,
+        isDeleted,
+        fp16,
+        firstSegmentWithoutCentroid);
+  }
+
+  private void check(
+      KnnVectorsFormat format,
+      VectorSimilarityFunction sim,
+      IntPredicate isDeleted,
+      boolean fp16,
+      boolean firstSegmentWithoutCentroid)
+      throws Exception {
     // Two segments of PER_SEGMENT docs. Deleted vectors get a large offset in dim 0, so a
     // centroid that still includes them is easy to tell apart from a live-only one.
     int total = 2 * PER_SEGMENT;
@@ -396,7 +455,7 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
       }
     }
 
-    Codec sqCodec = TestUtil.alwaysKnnVectorsFormat(new Lucene104ScalarQuantizedVectorsFormat());
+    Codec sqCodec = TestUtil.alwaysKnnVectorsFormat(format);
     try (Directory dir = newDirectory()) {
       int next = 0;
       if (firstSegmentWithoutCentroid) {
