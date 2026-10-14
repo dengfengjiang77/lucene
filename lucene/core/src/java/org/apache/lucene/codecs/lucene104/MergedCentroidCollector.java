@@ -16,6 +16,7 @@
  */
 package org.apache.lucene.codecs.lucene104;
 
+import static org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat.QUANTIZED_VECTOR_COMPONENT;
 import static org.apache.lucene.index.VectorSimilarityFunction.COSINE;
 import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
 
@@ -40,10 +41,14 @@ import org.apache.lucene.util.VectorUtil;
  * the centroid needs no pass of its own over the raw vectors.
  *
  * <p>{@link #wrap} returns a {@link MergeState} whose vector readers add every vector they return
- * to a per-segment sum, once per ordinal. {@link #finish} uses these sums only when the ordinals
- * added are exactly the live ones, and otherwise sums the live vectors in a separate pass.
+ * to a per-segment sum, once per ordinal. {@link #verifyAndComputeCentroid} uses these sums only
+ * when the ordinals added are exactly the live ones, and otherwise sums the live vectors in a
+ * separate pass.
  */
 final class MergedCentroidCollector {
+  /** Logged when the live vectors have to be summed in a separate pass. */
+  static final String FALLBACK_MESSAGE = "Centroid fallback: summing the live vectors again";
+
   private final FieldInfo fieldInfo;
   private final boolean cosine;
   private final float[][] segmentSums;
@@ -84,10 +89,11 @@ final class MergedCentroidCollector {
   }
 
   /**
-   * Writes the centroid of the live vectors into {@code centroid}. Returns the number of live
-   * vectors in the merged segments.
+   * Checks that the raw merge added exactly the live vectors, then writes their centroid into
+   * {@code centroid}. If the check fails, the live vectors are summed again in a separate pass.
+   * Returns the number of live vectors in the merged segments.
    */
-  int finish(MergeState mergeState, float[] centroid) throws IOException {
+  int verifyAndComputeCentroid(MergeState mergeState, float[] centroid) throws IOException {
     int liveVectorCount = 0;
     boolean collectedAll = true;
     for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
@@ -101,6 +107,8 @@ final class MergedCentroidCollector {
       }
       Bits liveDocs = mergeState.liveDocs[i];
       FixedBitSet added = segmentAdded[i];
+      // Case 1: the segment has no deletes, so all its vectors are live. It is fully collected if
+      // the number of ordinals added equals the number of vectors.
       if (liveDocs == null) {
         int live = values.size();
         liveVectorCount += live;
@@ -109,7 +117,8 @@ final class MergedCentroidCollector {
         }
         continue;
       }
-      // Reads doc ids only, not vectors.
+      // Case 2: the segment has deletes. Walk the doc ids (no vectors are read) and check that a
+      // vector was added if and only if its doc is live.
       KnnVectorValues.DocIndexIterator iterator = values.iterator();
       for (int doc = iterator.nextDoc(); doc != NO_MORE_DOCS; doc = iterator.nextDoc()) {
         boolean live = liveDocs.get(doc);
@@ -131,6 +140,9 @@ final class MergedCentroidCollector {
         }
       }
     } else {
+      if (mergeState.infoStream.isEnabled(QUANTIZED_VECTOR_COMPONENT)) {
+        mergeState.infoStream.message(QUANTIZED_VECTOR_COMPONENT, FALLBACK_MESSAGE);
+      }
       sumLiveVectors(mergeState, sum);
     }
     for (int j = 0; j < centroid.length; j++) {
@@ -178,7 +190,7 @@ final class MergedCentroidCollector {
 
   /**
    * Adds a vector the merge read to its segment's sum, unless that ordinal was already added. Which
-   * ordinals were added is checked in {@link #finish}.
+   * ordinals were added is checked in {@link #verifyAndComputeCentroid}.
    */
   private final class SegmentSum {
     private final float[] sum;
@@ -290,6 +302,8 @@ final class MergedCentroidCollector {
 
     @Override
     public FloatVectorValues copy() throws IOException {
+      // Not wrapped: a copy is usually read from another thread, and the sums are not thread-safe.
+      // Vectors read through it are missed, so verifyAndComputeCentroid falls back.
       return in.copy();
     }
 
@@ -317,6 +331,8 @@ final class MergedCentroidCollector {
   private static final class CollectingFloat16VectorValues extends Float16VectorValues {
     private final Float16VectorValues in;
     private final SegmentSum segmentSum;
+    // Reused fp32 copy of the current vector. Not thread-safe: the raw merge reads vectors from
+    // a single thread.
     private final float[] scratch;
 
     CollectingFloat16VectorValues(Float16VectorValues in, SegmentSum segmentSum) {
@@ -337,6 +353,7 @@ final class MergedCentroidCollector {
 
     @Override
     public Float16VectorValues copy() throws IOException {
+      // Not wrapped, for the same reasons as CollectingFloatVectorValues.copy().
       return in.copy();
     }
 

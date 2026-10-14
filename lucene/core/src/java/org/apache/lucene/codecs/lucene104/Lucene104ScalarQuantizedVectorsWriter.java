@@ -349,6 +349,7 @@ public class Lucene104ScalarQuantizedVectorsWriter extends FlatVectorsWriter {
       FieldInfo fieldInfo, MergeState mergeState, IntPredicate needsMergeScorer)
       throws IOException {
     if (fieldInfo.getVectorEncoding().isFloatingPoint() == false) {
+      // Byte vectors have no centroid, so this is only the raw copy of the vectors.
       rawVectorDelegate.mergeOneFlatVectorField(fieldInfo, mergeState);
       return null;
     }
@@ -357,7 +358,7 @@ public class Lucene104ScalarQuantizedVectorsWriter extends FlatVectorsWriter {
         new MergedCentroidCollector(fieldInfo, mergeState.knnVectorsReaders.length);
     rawVectorDelegate.mergeOneFlatVectorField(fieldInfo, centroidCollector.wrap(mergeState));
     final float[] mergedCentroid = new float[fieldInfo.getVectorDimension()];
-    int vectorCount = centroidCollector.finish(mergeState, mergedCentroid);
+    int vectorCount = centroidCollector.verifyAndComputeCentroid(mergeState, mergedCentroid);
     if (segmentWriteState.infoStream.isEnabled(QUANTIZED_VECTOR_COMPONENT)) {
       segmentWriteState.infoStream.message(
           QUANTIZED_VECTOR_COMPONENT, "Vectors' count:" + vectorCount);

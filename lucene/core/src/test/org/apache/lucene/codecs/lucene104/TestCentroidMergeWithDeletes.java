@@ -16,10 +16,14 @@
  */
 package org.apache.lucene.codecs.lucene104;
 
+import static org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat.QUANTIZED_VECTOR_COMPONENT;
+import static org.apache.lucene.codecs.lucene104.MergedCentroidCollector.FALLBACK_MESSAGE;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntPredicate;
 import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.KnnVectorsFormat;
@@ -34,6 +38,7 @@ import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.Float16VectorValues;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
@@ -69,6 +74,26 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
     VectorSimilarityFunction.DOT_PRODUCT,
     VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
   };
+
+  /** Counts how many times the centroid fallback ran. */
+  private static final class FallbackCounter extends InfoStream {
+    private final AtomicInteger count = new AtomicInteger();
+
+    @Override
+    public void message(String component, String message) {
+      if (FALLBACK_MESSAGE.equals(message)) {
+        count.incrementAndGet();
+      }
+    }
+
+    @Override
+    public boolean isEnabled(String component) {
+      return QUANTIZED_VECTOR_COMPONENT.equals(component);
+    }
+
+    @Override
+    public void close() {}
+  }
 
   /** A quarter of segment 0 deleted. */
   public void testFewDeletes() throws Exception {
@@ -149,7 +174,8 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
 
   /**
    * Drives the collector with each read pattern. IN_ORDER, REVERSE and TWICE add exactly the live
-   * vectors, so the collected sums are used; the other patterns must fall back.
+   * vectors, so the collected sums are used and the fallback does not run; the other patterns must
+   * fall back. Both fp32 and fp16 fields, so the fp16 fallback runs as well.
    */
   public void testFallbackOnUnexpectedReads() throws Exception {
     for (VectorSimilarityFunction sim :
@@ -157,7 +183,8 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
           VectorSimilarityFunction.EUCLIDEAN, VectorSimilarityFunction.COSINE
         }) {
       for (ReadPattern pattern : ReadPattern.values()) {
-        checkCollector(sim, pattern);
+        checkCollector(sim, pattern, false);
+        checkCollector(sim, pattern, true);
       }
     }
   }
@@ -174,14 +201,16 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
     checkSortedMerge(VectorSimilarityFunction.COSINE, true);
   }
 
-  private void checkCollector(VectorSimilarityFunction sim, ReadPattern pattern) throws Exception {
-    float[][] vectors = shiftedVectors(2 * PER_SEGMENT, sim);
+  private void checkCollector(VectorSimilarityFunction sim, ReadPattern pattern, boolean fp16)
+      throws Exception {
+    float[][] vectors = shiftedVectors(2 * PER_SEGMENT, sim, fp16);
     boolean[] deleted = new boolean[vectors.length];
     for (int i = 0; i < deleted.length; i++) {
       deleted[i] = i % 4 == 0;
     }
+    FallbackCounter fallbacks = new FallbackCounter();
     try (Directory dir = newDirectory()) {
-      writeTwoSegments(dir, vectors, deleted, sim, null);
+      writeTwoSegments(dir, vectors, deleted, sim, fp16, null);
       try (DirectoryReader reader = DirectoryReader.open(dir)) {
         int n = reader.leaves().size();
         assertEquals(2, n);
@@ -218,7 +247,7 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
                 null,
                 readers,
                 maxDocs,
-                InfoStream.NO_OUTPUT,
+                fallbacks,
                 null,
                 false,
                 null);
@@ -228,16 +257,22 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
         float[] centroid = new float[DIMS];
         try {
           for (int i = 0; i < n; i++) {
-            read(wrapped.knnVectorsReaders[i], liveDocs[i], pattern);
+            read(wrapped.knnVectorsReaders[i], liveDocs[i], pattern, fp16);
           }
-          assertEquals(nextDoc, collector.finish(state, centroid));
+          assertEquals(nextDoc, collector.verifyAndComputeCentroid(state, centroid));
         } finally {
           for (KnnVectorsReader r : readers) {
             r.finishMerge();
           }
         }
+        boolean collectsLiveVectors =
+            pattern == ReadPattern.IN_ORDER
+                || pattern == ReadPattern.REVERSE
+                || pattern == ReadPattern.TWICE;
+        String message = sim + " " + pattern + " fp16=" + fp16;
+        assertEquals(message, collectsLiveVectors ? 0 : 1, fallbacks.count.get());
         assertArrayEquals(
-            sim + " " + pattern,
+            message,
             liveMean(vectors, deleted, sim == VectorSimilarityFunction.COSINE),
             centroid,
             1e-3f);
@@ -245,20 +280,37 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
     }
   }
 
-  private static void read(KnnVectorsReader reader, Bits liveDocs, ReadPattern pattern)
+  private static void read(
+      KnnVectorsReader reader, Bits liveDocs, ReadPattern pattern, boolean fp16)
       throws IOException {
     switch (pattern) {
-      case IN_ORDER -> readLive(reader.getFloatVectorValues(FIELD), liveDocs, false, false);
+      case IN_ORDER -> readLive(values(reader, fp16, false), liveDocs, false, false);
       case NONE -> {}
-      case REVERSE -> readLive(reader.getFloatVectorValues(FIELD), liveDocs, true, false);
+      case REVERSE -> readLive(values(reader, fp16, false), liveDocs, true, false);
       case TWICE -> {
-        readLive(reader.getFloatVectorValues(FIELD), liveDocs, false, false);
-        readLive(reader.getFloatVectorValues(FIELD), liveDocs, false, false);
+        readLive(values(reader, fp16, false), liveDocs, false, false);
+        readLive(values(reader, fp16, false), liveDocs, false, false);
       }
-      case VIA_COPY -> readLive(reader.getFloatVectorValues(FIELD).copy(), liveDocs, false, false);
-      case WITH_DELETED -> readLive(reader.getFloatVectorValues(FIELD), liveDocs, false, true);
-      case SWAPPED -> readSwapped(reader.getFloatVectorValues(FIELD), liveDocs);
+      case VIA_COPY -> readLive(values(reader, fp16, true), liveDocs, false, false);
+      case WITH_DELETED -> readLive(values(reader, fp16, false), liveDocs, false, true);
+      case SWAPPED -> readSwapped(values(reader, fp16, false), liveDocs);
     }
+  }
+
+  /**
+   * The vectors of {@link #FIELD} as fp32, read through the wrapped reader. An fp16 field is read
+   * through its fp16 values, converted the way the merge does. With {@code copy}, the vector values
+   * are copied first, which the collector does not wrap.
+   */
+  private static FloatVectorValues values(KnnVectorsReader reader, boolean fp16, boolean copy)
+      throws IOException {
+    if (fp16) {
+      Float16VectorValues values = reader.getFloat16VectorValues(FIELD);
+      return new Lucene104ScalarQuantizedVectorsWriter.Float16AsFloatVectorValues(
+          copy ? values.copy() : values);
+    }
+    FloatVectorValues values = reader.getFloatVectorValues(FIELD);
+    return copy ? values.copy() : values;
   }
 
   private static void readSwapped(FloatVectorValues values, Bits liveDocs) throws IOException {
@@ -303,20 +355,21 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
    */
   private void checkSortedMerge(VectorSimilarityFunction sim, boolean sortingCodecReader)
       throws Exception {
-    float[][] vectors = shiftedVectors(2 * PER_SEGMENT, sim);
+    float[][] vectors = shiftedVectors(2 * PER_SEGMENT, sim, false);
     boolean[] deleted = new boolean[vectors.length];
     for (int i = 0; i < deleted.length; i++) {
       deleted[i] = i % 4 == 0;
     }
     Sort sort = new Sort(new SortField("sort", SortField.Type.INT));
     Codec sqCodec = TestUtil.alwaysKnnVectorsFormat(new Lucene104ScalarQuantizedVectorsFormat());
+    FallbackCounter fallbacks = new FallbackCounter();
     try (Directory dir = newDirectory();
         Directory target = newDirectory()) {
-      writeTwoSegments(dir, vectors, deleted, sim, sortingCodecReader ? null : sort);
+      writeTwoSegments(dir, vectors, deleted, sim, false, sortingCodecReader ? null : sort);
       Directory mergedDir;
       if (sortingCodecReader) {
         Sort reversed = new Sort(new SortField("sort", SortField.Type.INT, true));
-        IndexWriterConfig iwc = new IndexWriterConfig().setCodec(sqCodec);
+        IndexWriterConfig iwc = new IndexWriterConfig().setCodec(sqCodec).setInfoStream(fallbacks);
         try (DirectoryReader reader = DirectoryReader.open(dir);
             IndexWriter w = new IndexWriter(target, iwc)) {
           CodecReader[] sorted = new CodecReader[reader.leaves().size()];
@@ -330,7 +383,8 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
         }
         mergedDir = target;
       } else {
-        IndexWriterConfig iwc = new IndexWriterConfig().setCodec(sqCodec).setIndexSort(sort);
+        IndexWriterConfig iwc =
+            new IndexWriterConfig().setCodec(sqCodec).setIndexSort(sort).setInfoStream(fallbacks);
         try (IndexWriter w = new IndexWriter(dir, iwc)) {
           w.forceMerge(1);
           w.commit();
@@ -346,6 +400,7 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
                 .getCentroid();
         float[] expected = liveMean(vectors, deleted, sim == VectorSimilarityFunction.COSINE);
         assertEquals(leaf.numDocs(), values.size());
+        assertEquals(0, fallbacks.count.get());
         assertArrayEquals(
             sim + " sortingCodecReader=" + sortingCodecReader, expected, merged, 1e-3f);
       }
@@ -355,8 +410,9 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
   /**
    * Random vectors shifted away from the origin, with an extra offset on dim 0 for every fourth
    * one. A centroid of zero, or one that includes the wrong vectors, then fails the comparison.
+   * With {@code fp16}, the values are rounded to fp16, which is what the index stores.
    */
-  private static float[][] shiftedVectors(int count, VectorSimilarityFunction sim) {
+  private static float[][] shiftedVectors(int count, VectorSimilarityFunction sim, boolean fp16) {
     float[][] vectors = new float[count][DIMS];
     for (int i = 0; i < count; i++) {
       for (int d = 0; d < DIMS; d++) {
@@ -368,6 +424,11 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
       if (sim == VectorSimilarityFunction.DOT_PRODUCT) {
         VectorUtil.l2normalize(vectors[i]);
       }
+      if (fp16) {
+        for (int d = 0; d < DIMS; d++) {
+          vectors[i][d] = Float.float16ToFloat(Float.floatToFloat16(vectors[i][d]));
+        }
+      }
     }
     return vectors;
   }
@@ -378,6 +439,7 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
       float[][] vectors,
       boolean[] deleted,
       VectorSimilarityFunction sim,
+      boolean fp16,
       Sort indexSort)
       throws IOException {
     IndexWriterConfig iwc =
@@ -389,7 +451,7 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
     }
     try (IndexWriter w = new IndexWriter(dir, iwc)) {
       for (int i = 0; i < vectors.length; i++) {
-        Document doc = doc(i, vectors[i], sim, false);
+        Document doc = doc(i, vectors[i], sim, fp16);
         doc.add(new NumericDocValuesField("sort", random().nextInt(1000)));
         w.addDocument(doc);
         if (i == PER_SEGMENT - 1) {
@@ -456,6 +518,7 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
     }
 
     Codec sqCodec = TestUtil.alwaysKnnVectorsFormat(format);
+    FallbackCounter fallbacks = new FallbackCounter();
     try (Directory dir = newDirectory()) {
       int next = 0;
       if (firstSegmentWithoutCentroid) {
@@ -472,7 +535,10 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
       }
       // No merges until forceMerge, so the centroid comes from exactly one merge of both segments.
       IndexWriterConfig iwc =
-          new IndexWriterConfig().setCodec(sqCodec).setMergePolicy(NoMergePolicy.INSTANCE);
+          new IndexWriterConfig()
+              .setCodec(sqCodec)
+              .setMergePolicy(NoMergePolicy.INSTANCE)
+              .setInfoStream(fallbacks);
       try (IndexWriter w = new IndexWriter(dir, iwc)) {
         for (; next < total; next++) {
           w.addDocument(doc(next, vectors[next], sim, fp16));
@@ -508,6 +574,7 @@ public class TestCentroidMergeWithDeletes extends LuceneTestCase {
                     .getCentroid();
           }
           assertEquals(liveCount, values.size());
+          assertEquals(0, fallbacks.count.get());
           float[] expected = liveMean(vectors, deleted, sim == VectorSimilarityFunction.COSINE);
           assertArrayEquals(sim + " fp16=" + fp16, expected, merged, 1e-3f);
         }
